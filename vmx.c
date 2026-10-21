@@ -211,6 +211,76 @@ void
 vmxinit(void)
 {
   /* HW1 part 1: write this function; see HW1.md. */
+  uint a, b, c, d;
+  uint64 fc, cr0, cr4;
+  int id = cpuid();
+  char *region;
+
+  /* CPUID.1:ECX.VMX[bit 5] says whether the CPU has VT-x at all. */
+  cpuid_insn(1, &a, &b, &c, &d);
+  if(!(c & CPUID1_ECX_VMX)){
+    cprintf("cpu%d: no VMX support\n", id);
+    return;
+  }
+
+  /*
+   * IA32_FEATURE_CONTROL gates VMXON.  Once its lock bit is set it
+   * cannot be changed until reset, and VMXON faults unless the
+   * "enable VMX outside SMX" bit is set.  The firmware normally
+   * enables VMX and locks this MSR; if it left the MSR unlocked we
+   * can set the bits ourselves.  This MSR exists only when CPUID
+   * reports VMX, so the read is safe here.
+   */
+  fc = rdmsr(MSR_IA32_FEATURE_CONTROL);
+  if(!(fc & FEATURE_CONTROL_LOCKED)){
+    fc |= FEATURE_CONTROL_LOCKED | FEATURE_CONTROL_VMXON_OUTSIDE_SMX;
+    wrmsr(MSR_IA32_FEATURE_CONTROL, fc);
+  }
+  if(!(fc & FEATURE_CONTROL_VMXON_OUTSIDE_SMX)){
+    cprintf("cpu%d: VMX disabled by firmware\n", id);
+    return;
+  }
+
+  /*
+   * In VMX operation CR0 and CR4 must obey the fixed-bit MSRs
+   * (for example CR0.NE = 1 and CR4.VMXE = 1).  FIXED0 lists the bits
+   * that must be 1 (a bit set in FIXED0 must be 1), and FIXED1 lists
+   * the bits that may be 1 (a bit clear in FIXED1 must be 0).  So OR
+   * in FIXED0, then AND with FIXED1.  VMXON fails otherwise
+   * (SDM 26.8).  CR4.VMXE must be set before VMXON is executed.
+   */
+  cr0 = rcr0();
+  cr0 |= rdmsr(MSR_IA32_VMX_CR0_FIXED0);
+  cr0 &= rdmsr(MSR_IA32_VMX_CR0_FIXED1);
+  lcr0(cr0);
+  cr4 = rcr4() | CR4_VMXE;
+  cr4 |= rdmsr(MSR_IA32_VMX_CR4_FIXED0);
+  cr4 &= rdmsr(MSR_IA32_VMX_CR4_FIXED1);
+  lcr4(cr4);
+
+  /*
+   * The VMXON region must start with the VMCS revision identifier
+   * (bits 30:0 of IA32_VMX_BASIC; bit 31 of the region must be 0).
+   * VMXON also requires the region to be 4 KB-aligned (SDM 27.11.5),
+   * which a kalloc() page is.  Zero it first so the rest is
+   * deterministic.  Each CPU keeps its region while VMX is on.
+   */
+  vmcs_revision = rdmsr(MSR_IA32_VMX_BASIC) & 0x7FFFFFFF;
+  if((region = kalloc()) == 0){
+    cprintf("cpu%d: no memory for the VMXON region\n", id);
+    return;
+  }
+  memset(region, 0, PGSIZE);
+  *(uint*)region = vmcs_revision;
+
+  /* VMXON takes the region's physical address. */
+  if(vmxon(V2P(region)) < 0){
+    cprintf("cpu%d: vmxon failed\n", id);
+    kfree(region);
+    return;
+  }
+  cpus[id].vmx_ok = 1;
+  cprintf("cpu%d: VMX enabled\n", id);
 }
 
 /*

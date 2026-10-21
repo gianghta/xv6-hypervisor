@@ -16,7 +16,13 @@ Fill in this file and hand it in with your code. Replace each
 > In Step 1, why does the function `return` when VMX is missing instead
 > of calling `panic()`?
 
-**Answer:** (your answer)
+**Answer:** VT-x is an optional feature: xv6 itself doesn't need it,
+and only the hypervisor (`runvm`) uses it. `panic()` would halt the
+whole kernel at boot, so any machine without VMX could not run xv6 at
+all. Returning instead leaves `cpus[id].vmx_ok` at 0, so the system
+still boots normally (as with `QEMUKVM=`), and `vmcreate()` and
+`vmrun()` check that flag and simply refuse to create or run VMs on
+that CPU.
 
 ### Question 1.2
 
@@ -24,21 +30,41 @@ Fill in this file and hand it in with your code. Replace each
 > locked VMX. Why does the code still handle the unlocked case instead
 > of just failing?
 
-**Answer:** (your answer)
+**Answer:** Not all firmware locks the MSR. Virtual firmware such as
+Bochs's BIOS, and some real BIOSes, leave IA32_FEATURE_CONTROL
+unlocked, and there VMXON would fault because it requires the lock bit
+to be set. While the MSR is unlocked we are allowed to write it, so we
+set the lock bit and "enable VMX outside SMX" ourselves and VMX works.
+Just failing would needlessly disable the hypervisor on machines that
+are perfectly able to run it; we only give up when the firmware has
+locked VMX off, which we cannot change.
 
 ### Question 1.3
 
 > In Step 3, what would happen if we skipped `lcr4(cr4)` and went
 > straight to `VMXON`?
 
-**Answer:** (your answer)
+**Answer:** The new value would only exist in the local variable `cr4`,
+so the real CR4 would still have VMXE = 0 (and might not obey the
+FIXED0/FIXED1 rules). VMXON executed with CR4.VMXE = 0 raises an
+invalid-opcode exception (#UD) instead of returning an error code, so
+the `vmxon()` wrapper never gets to report a failure: the fault happens
+in the kernel, and xv6 panics at boot on every CPU.
 
 ### Question 1.4
 
 > In Step 4, why does each CPU need its own VMXON region? What could go
 > wrong if all CPUs shared one?
 
-**Answer:** (your answer)
+**Answer:** VMX operation is per logical processor, and while a CPU is
+in VMX operation it may use its VMXON region to hold its own internal,
+implementation-specific VMX state; the SDM (27.11.5) therefore tells
+software to use a separate region for each logical processor. If all
+CPUs shared one page, they would overwrite each other's private state
+in it, which could make VMX behave unpredictably on any of them. A
+shared page would also be fragile to manage: for example, if one CPU's
+VMXON failed and it freed the page, the other CPUs would still be
+using freed memory.
 
 ## Part 2: Creating a VM, its memory, and the EPT
 
