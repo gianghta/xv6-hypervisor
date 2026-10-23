@@ -304,7 +304,18 @@ static int
 adjustctl(uint msr, uint want, uint *ctl)
 {
   /* HW1 part 3: write this function; see HW1.md. */
-  return -1;
+  uint64 cap = rdmsr(msr);
+  /* Force on the required bits, then mask off unsupported ones. */
+  uint v = (want | (uint)cap) & (uint)(cap >> 32);
+
+  /* If masking dropped a bit we asked for, the CPU can't do it. */
+  if((v & want) != want){
+    cprintf("vmx: controls 0x%x unsupported (MSR 0x%x)\n",
+            (uint64)(want & ~v), (uint64)msr);
+    return -1;
+  }
+  *ctl = v;
+  return 0;
 }
 
 /*
@@ -339,6 +350,203 @@ static int
 vmcsinit(struct vm *vm)
 {
   /* HW1 part 3: write this function; see HW1.md. */
+  uint pin, cpu, cpu2, exitctl, entryctl;
+  /*
+   * IA32_VMX_BASIC bit 55 says that the "TRUE" capability MSRs exist.
+   * They report the real default-1 controls; the older MSRs force
+   * some bits (like CR3-load exiting) to 1 on old CPUs.
+   */
+  int t = (rdmsr(MSR_IA32_VMX_BASIC) & VMX_BASIC_TRUE_CTLS) != 0;
+  uint64 cr0, cr4;
+  int seg;
+
+  /*
+   * Compute all five control words.  See SDM 27.6 (execution
+   * controls), 27.7 (exit controls) and 27.8 (entry controls).
+   */
+  if(adjustctl(t ? MSR_IA32_VMX_TRUE_PINBASED_CTLS : MSR_IA32_VMX_PINBASED_CTLS,
+               /*
+                * Pin-based: exit on external interrupts (so the host
+                * kernel, not the guest, handles them) and on NMIs.
+                */
+               PIN_EXTINT_EXITING | PIN_NMI_EXITING, &pin) < 0 ||
+     adjustctl(t ? MSR_IA32_VMX_TRUE_PROCBASED_CTLS : MSR_IA32_VMX_PROCBASED_CTLS,
+               /*
+                * Primary processor-based: exit on HLT, exit on every
+                * IN/OUT (no I/O bitmap), and enable the secondary
+                * controls word, which holds EPT and unrestricted guest.
+                */
+               CPU_HLT_EXITING | CPU_UNCOND_IO_EXITING | CPU_ACTIVATE_SECONDARY,
+               &cpu) < 0 ||
+     adjustctl(MSR_IA32_VMX_PROCBASED_CTLS2,
+               /*
+                * Secondary: nested paging via EPT, and unrestricted
+                * guest (lets the guest run with CR0.PE/PG off, i.e.
+                * real or paging-less protected mode).  Unrestricted
+                * guest requires EPT.
+                */
+               CPU2_ENABLE_EPT | CPU2_UNRESTRICTED_GUEST, &cpu2) < 0 ||
+     adjustctl(t ? MSR_IA32_VMX_TRUE_EXIT_CTLS : MSR_IA32_VMX_EXIT_CTLS,
+               /*
+                * Exit: the host is a 64-bit kernel, so the processor
+                * must return to 64-bit mode (HOST_ADDR_SPACE_SIZE);
+                * save the guest's EFER into the VMCS on exit and load
+                * the host's EFER from the VMCS.  "Acknowledge
+                * interrupt on exit" is deliberately not set.
+                */
+               EXIT_HOST_ADDR_SPACE_SIZE | EXIT_SAVE_IA32_EFER |
+               EXIT_LOAD_IA32_EFER, &exitctl) < 0 ||
+     adjustctl(t ? MSR_IA32_VMX_TRUE_ENTRY_CTLS : MSR_IA32_VMX_ENTRY_CTLS,
+               /*
+                * Entry: load the guest's EFER from the VMCS.  The
+                * "IA-32e mode guest" bit is set later, in vmrun(),
+                * according to the guest's EFER.LMA.
+                */
+               ENTRY_LOAD_IA32_EFER, &entryctl) < 0)
+    return -1;
+
+  /*
+   * Without the TRUE capability MSRs these may be forced on; the
+   * guest's trampoline would then exit on MOV to CR3.  Our run loop
+   * has no code to emulate CR accesses or to build I/O or MSR bitmaps,
+   * so fail rather than run a VM that would behave unexpectedly.
+   */
+  if(cpu & (CPU_CR3_LOAD_EXITING | CPU_CR3_STORE_EXITING |
+            CPU_USE_IO_BITMAPS | CPU_USE_MSR_BITMAPS)){
+    cprintf("vmx: CPU forces unwanted exiting controls 0x%x\n", (uint64)cpu);
+    return -1;
+  }
+
+  /*
+   * Control fields.  No MSR bitmap, so every RDMSR/WRMSR exits;
+   * unconditional I/O exiting, so every IN/OUT exits.
+   */
+  vmwrite(PIN_BASED_VM_EXEC_CONTROL, pin);
+  vmwrite(CPU_BASED_VM_EXEC_CONTROL, cpu);
+  vmwrite(SECONDARY_VM_EXEC_CONTROL, cpu2);
+  vmwrite(VM_EXIT_CONTROLS, exitctl);
+  vmwrite(VM_ENTRY_CONTROLS, entryctl);
+
+  /*
+   * The exception bitmap has one bit per exception vector 0-31; a set
+   * bit makes that exception cause a VM exit instead of being
+   * delivered through the guest's IDT.  The guest has no IDT yet, so
+   * without this any guest exception would escalate to a triple fault
+   * with no information.  With it, each exception exits with its
+   * vector, error code, and RIP.
+   */
+  vmwrite(EXCEPTION_BITMAP, 0xFFFFFFFF); /* no guest IDT: exit on everything */
+  /*
+   * For page faults the mask/match pair further filters which error
+   * codes exit; with all bits set in the bitmap, mask = match = 0
+   * means "every page fault exits" (SDM 27.6.3).
+   */
+  vmwrite(PAGE_FAULT_ERROR_CODE_MASK, 0);
+  vmwrite(PAGE_FAULT_ERROR_CODE_MATCH, 0);
+
+  /* No CR3-target values (they would let some MOV to CR3 skip exiting). */
+  vmwrite(CR3_TARGET_COUNT, 0);
+  /* No MSR save/load lists on exit or entry. */
+  vmwrite(VM_EXIT_MSR_STORE_COUNT, 0);
+  vmwrite(VM_EXIT_MSR_LOAD_COUNT, 0);
+  vmwrite(VM_ENTRY_MSR_LOAD_COUNT, 0);
+  /* Don't inject any event (interrupt/exception) on VM entry. */
+  vmwrite(VM_ENTRY_INTR_INFO_FIELD, 0);
+  /* Tell the processor where this guest's EPT lives (SDM 27.6.11). */
+  vmwrite(EPT_POINTER, vm->eptp);
+
+  /*
+   * The guest/host mask says which CR0/CR4 bits are owned by the host:
+   * guest writes to an owned bit that differ from the read shadow
+   * cause an exit, and guest reads of an owned bit return the shadow
+   * value.  The host owns CR4.VMXE: the guest reads it as 0 and can't
+   * change it.  (The real CR4.VMXE must stay 1 while in VMX
+   * operation, see GUEST_CR4 below.)  CR0 has no owned bits, so the
+   * guest may freely change CR0.PG, CR0.PE etc.
+   */
+  vmwrite(CR0_GUEST_HOST_MASK, 0);
+  vmwrite(CR0_READ_SHADOW, 0);
+  vmwrite(CR4_GUEST_HOST_MASK, CR4_VMXE);
+  vmwrite(CR4_READ_SHADOW, 0);
+
+  /*
+   * Where the processor resumes the host after every VM exit.  This
+   * never changes, so it is written once here.  (HOST_RSP is written
+   * by vmx_enter on every entry, since it depends on the stack depth.)
+   */
+  vmwrite(HOST_RIP, (uint64)vmx_exit);
+
+  /*
+   * Guest state: flat 32-bit protected mode with paging off.
+   * Unrestricted guest allows CR0.PE and CR0.PG to differ from the
+   * fixed-bit MSRs; every other fixed bit still applies.
+   * So start from PE|ET|NE, force on any other FIXED0 bits (except
+   * PE and PG), and mask with FIXED1.  NE is required by FIXED0.
+   */
+  cr0 = CR0_PE | CR0_ET | CR0_NE;
+  cr0 |= rdmsr(MSR_IA32_VMX_CR0_FIXED0) & ~(uint64)(CR0_PE | CR0_PG);
+  cr0 &= rdmsr(MSR_IA32_VMX_CR0_FIXED1);
+  /*
+   * CR4 in the VMCS must satisfy the fixed bits too, and since the CPU
+   * is in VMX operation, VMXE must be 1 in the real CR4; the guest
+   * sees it as 0 through the read shadow set above.
+   */
+  cr4 = CR4_VMXE | rdmsr(MSR_IA32_VMX_CR4_FIXED0);
+  cr4 &= rdmsr(MSR_IA32_VMX_CR4_FIXED1);
+  vmwrite(GUEST_CR0, cr0);
+  /* CR3 is irrelevant until the guest turns paging on. */
+  vmwrite(GUEST_CR3, 0);
+  vmwrite(GUEST_CR4, cr4);
+  /* DR7 reset value (bit 10 is reserved-1): no hardware breakpoints. */
+  vmwrite(GUEST_DR7, 0x400);
+
+  /*
+   * Segments (SDM 27.4.1).  CS is a flat 32-bit code segment with
+   * selector 0x08, and ES/SS/DS/FS/GS are flat 32-bit data segments
+   * with selector 0x10; base 0, limit 4 GB.  The selector values are
+   * only labels here since the guest has no GDT, but they match the
+   * layout the guest's own GDT will use.
+   */
+  guestseg(SEG_CS, 0x08, 0, 0xFFFFFFFF, AR_CODE32);
+  for(seg = SEG_ES; seg <= SEG_GS; seg++)
+    if(seg != SEG_CS)
+      guestseg(seg, 0x10, 0, 0xFFFFFFFF, AR_DATA32);
+  /*
+   * LDTR is marked unusable (as after reset, no LDT), and TR must be
+   * valid for VM entry: a busy TSS (32-bit, limit 0xFFFF) is the
+   * simplest value that passes the guest-state checks of SDM 29.3.1.2.
+   */
+  guestseg(SEG_LDTR, 0, 0, 0, AR_UNUSABLE);
+  guestseg(SEG_TR, 0, 0, 0xFFFF, AR_TSS32_BUSY);
+
+  /* The guest has no GDT or IDT until it loads its own. */
+  vmwrite(GUEST_GDTR_BASE, 0);
+  vmwrite(GUEST_GDTR_LIMIT, 0);
+  vmwrite(GUEST_IDTR_BASE, 0);
+  vmwrite(GUEST_IDTR_LIMIT, 0);
+
+  /*
+   * Non-register guest state (SDM 27.4.2).  Interruptibility 0 means
+   * no blocking by STI/MOV SS; activity state 0 means "active" (not
+   * halted).  Pending debug exceptions must be consistent with that.
+   */
+  vmwrite(GUEST_INTERRUPTIBILITY_INFO, 0);
+  vmwrite(GUEST_ACTIVITY_STATE, 0);
+  vmwrite(GUEST_PENDING_DBG_EXCEPTIONS, 0);
+  /* No shadow VMCS: the link pointer must be all ones. */
+  vmwrite(VMCS_LINK_POINTER, ~0ULL);
+  /* Remaining MSR-backed guest state: all zero. */
+  vmwrite(GUEST_IA32_DEBUGCTL, 0);
+  vmwrite(GUEST_SYSENTER_CS, 0);
+  vmwrite(GUEST_SYSENTER_ESP, 0);
+  vmwrite(GUEST_SYSENTER_EIP, 0);
+
+  /* Part 3 checkpoint (passed); uncomment to check again. */
+  /*
+  cprintf("vmcs: cpu2=0x%x cr0=0x%x cr4=0x%x link=0x%x\n",
+          vmread(SECONDARY_VM_EXEC_CONTROL), vmread(GUEST_CR0),
+          vmread(GUEST_CR4), vmread(VMCS_LINK_POINTER));
+  */
   return 0;
 }
 
@@ -374,7 +582,37 @@ static uint64*
 eptwalk(uint64 *pml4, uint64 gpa, int alloc)
 {
   /* HW1 part 2: write this function; see HW1.md. */
-  return 0;
+  uint64 *table = pml4, *e;
+  char *next;
+  int level;
+
+  /*
+   * Walk levels 3 (PML4), 2 (PDPT) and 1 (PD); level 0, the page
+   * table, is indexed after the loop.  Index = 9 bits starting at
+   * bit 12 + 9*level.
+   */
+  for(level = 3; level > 0; level--){
+    e = &table[(gpa >> (12 + 9*level)) & 0x1FF];
+    if(*e & EPT_RWX){
+      /* Present: descend.  The entry holds a physical address. */
+      table = (uint64*)P2V(EPT_ADDR(*e));
+    } else {
+      if(!alloc || (next = kalloc()) == 0)
+        return 0;
+      /* kalloc() doesn't zero; a non-zero junk entry would look present. */
+      memset(next, 0, PGSIZE);
+      /*
+       * Non-leaf entries grant R/W/X so that only the leaf entry
+       * restricts permissions (the effective permission is the AND
+       * over all levels).
+       */
+      *e = V2P(next) | EPT_RWX;
+      table = (uint64*)next;
+    }
+  }
+
+  /* Step A2 (your turn): return a pointer to the leaf entry for gpa. */
+  return &table[(gpa >> 12) & 0x1FF];
 }
 
 /*
@@ -452,6 +690,136 @@ vmcreate(char *image, int len, int memsz)
   int id, n, off, r;
 
   /* HW1 part 2: write this function; see HW1.md. */
+  /* The image must fit in guest memory above its load address. */
+  if(memsz <= 0 || memsz > VM_MAXMEM || len < 0 || VM_LOAD_ADDR + len > memsz)
+    return -1;
+
+  /*
+   * The VMX capability MSRs don't exist without VMX; reading them faults.
+   * pushcli() keeps us on one CPU while we look at its flag.
+   */
+  pushcli();
+  r = mycpu()->vmx_ok;
+  popcli();
+  if(!r)
+    return -1;
+
+  /*
+   * We need: 4-level EPT walks, write-back EPT memory type, INVEPT
+   * and its single-context type (SDM Appendix A.10).
+   */
+  need = EPT_CAP_WALK_4 | EPT_CAP_MEMTYPE_WB | EPT_CAP_INVEPT | EPT_CAP_INVEPT_SINGLE;
+  if((rdmsr(MSR_IA32_VMX_EPT_VPID_CAP) & need) != need){
+    cprintf("vmx: CPU lacks required EPT features\n");
+    return -1;
+  }
+
+  /* Claim a free VM slot under the lock. */
+  acquire(&vms.lock);
+  for(id = 0; id < NVM; id++)
+    if(!vms.vm[id].used)
+      break;
+  if(id == NVM){
+    release(&vms.lock);
+    return -1;
+  }
+  vm = &vms.vm[id];
+  /* Zero everything: null pointers (for vmfree), flushed = 0, regs = 0. */
+  memset(vm, 0, sizeof(*vm));
+  vm->used = 1;
+  vm->owner = myproc();
+  release(&vms.lock);
+
+  vm->memsz = PGROUNDUP(memsz);
+  vm->rflags = 0x2;  /* bit 1 is reserved and must be 1 */
+
+  /*
+   * The VMCS page.  Zero it: VMCS contents are undefined to software,
+   * but starting from zeros keeps the revision-id word and abort
+   * indicator clean (the revision id is set below).
+   */
+  if((vm->vmcs = kalloc()) == 0)
+    goto bad;
+  memset(vm->vmcs, 0, PGSIZE);
+
+  /* The EPT PML4: must be zeroed, since zero entries mean "not present". */
+  if((vm->ept = (uint64*)kalloc()) == 0)
+    goto bad;
+  memset(vm->ept, 0, PGSIZE);
+  /*
+   * EPT pointer (SDM 27.6.11): physical address of the PML4 in the
+   * high bits, EPT paging-structure memory type in bits 2:0 (6 =
+   * write-back), and page-walk length minus one in bits 5:3 (3 = a
+   * 4-level walk).
+   */
+  vm->eptp = V2P(vm->ept) | EPTP_WALK_4 | EPTP_MEMTYPE_WB;
+
+  /*
+   * Guest memory: zeroed 4 KB pages, readable, writable, executable,
+   * write-back cacheable.  Guest-physical address gpa maps to the
+   * host page "mem".  xv6's kfree() fills freed pages with junk, so
+   * we zero here; otherwise the guest would see host leftovers
+   * (and a security leak).  The leaf memory type (bits 5:3) is
+   * valid only in leaf entries.
+   */
+  for(gpa = 0; gpa < vm->memsz; gpa += PGSIZE){
+    if((pte = eptwalk(vm->ept, gpa, 1)) == 0 || (mem = kalloc()) == 0)
+      goto bad;
+    memset(mem, 0, PGSIZE);
+    *pte = V2P(mem) | EPT_RWX | EPT_MEMTYPE_WB;
+  }
+
+  /*
+   * Copy the image in, one guest page at a time.  The guest-physical
+   * range is contiguous but the host pages backing it are not, so
+   * translate each page through the EPT in software.
+   */
+  for(off = 0; off < len; off += n){
+    gpa = VM_LOAD_ADDR + off;
+    /* Bytes left in this guest page, capped by the bytes left to copy. */
+    n = PGSIZE - gpa % PGSIZE;
+    if(n > len - off)
+      n = len - off;
+    /* Already populated above (the size check guarantees it). */
+    pte = eptwalk(vm->ept, gpa, 0);
+    memmove((char*)P2V(EPT_ADDR(*pte)) + gpa % PGSIZE, image + off, n);
+  }
+
+  /* Part 2 checkpoint (passed); uncomment to check again. */
+  /*
+  cprintf("vmcreate: vm %d, memsz %x, eptp %x\n", id, vm->memsz, vm->eptp);
+  pte = eptwalk(vm->ept, VM_LOAD_ADDR, 0);
+  cprintf("image word %x, guest word %x\n", (uint64)*(uint*)image,
+          (uint64)*(uint*)P2V(EPT_ADDR(*pte)));
+  */
+
+  /*
+   * Prepare the VMCS.  First write the revision identifier at the
+   * start of the VMCS page (SDM 27.2), without which VMPTRLD fails.
+   * VMCLEAR initializes the VMCS and puts it in the "clear" launch
+   * state, which is what VMLAUNCH requires.  VMPTRLD makes it current
+   * so that vmcsinit()'s VMWRITEs go to it.  pushcli() keeps us on
+   * this CPU, because "current" is per-CPU state.
+   */
+  *(uint*)vm->vmcs = vmcs_revision;
+  pushcli();
+  if(!mycpu()->vmx_ok || vmclear(V2P(vm->vmcs)) < 0 || vmptrld(V2P(vm->vmcs)) < 0){
+    popcli();
+    goto bad;
+  }
+  r = vmcsinit(vm);
+  /*
+   * Always VMCLEAR when done, even on error, so no CPU holds the
+   * VMCS cached and it can be freed or loaded elsewhere.
+   */
+  vmclear(V2P(vm->vmcs));
+  popcli();
+  if(r < 0)
+    goto bad;
+  return id;
+
+bad:
+  vmfree(vm);
   return -1;
 }
 

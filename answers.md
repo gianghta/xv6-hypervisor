@@ -75,7 +75,15 @@ using freed memory.
 > would go wrong if the hypervisor gave the guest direct access to the
 > host's physical memory instead?
 
-**Answer:** (your answer)
+**Answer:** The EPT translates guest-physical addresses (what the guest believes
+is RAM) to host-physical addresses (real memory), as a second stage
+after the guest's own page tables. The hypervisor controls it: it
+builds the tables and gives the CPU the EPTP through the VMCS, and the
+guest can neither see nor change it. With direct access to host
+physical memory, the guest could read or overwrite anything, including
+the host kernel, other processes and other VMs, so there would be no
+isolation; it would also expect RAM at addresses the host already
+uses for itself.
 
 ### Question 2.2
 
@@ -83,7 +91,18 @@ using freed memory.
 > zero every new table. These are two different reasons to zero. State
 > each, and say what the guest or the CPU would see if we skipped it.
 
-**Answer:** (your answer)
+**Answer:** Guest pages (Step B7) are zeroed so the guest cannot see what was
+there before: kalloc() returns recycled pages full of junk or of
+leftover data from the kernel or other processes. Without it the guest
+could read host data (a security leak), its behavior would depend on
+what ran earlier, and helloguest's uninitialized globals would not be
+zero, since a flat binary has no loader to clear them. New EPT tables
+are zeroed for a different reason: an all-zero entry means "not
+present". Without it, junk entries (kfree() fills pages with 0x01, so
+the R bit is set) would look present to the CPU and to eptwalk(), and
+would point at bogus physical addresses, giving the guest random host
+memory, causing EPT misconfigurations, or making eptfree() free pages
+that were never ours.
 
 ### Question 2.3
 
@@ -91,7 +110,14 @@ using freed memory.
 > `eptwalk()`, instead of one `memmove` of `len` bytes to the guest's
 > first page?
 
-**Answer:** (your answer)
+**Answer:** Guest-physical memory is contiguous, but the host pages backing it
+are not: Step B7 got each one separately from kalloc(), so they are
+scattered and in no particular order. A single memmove of len bytes
+starting at the host page behind the first guest page would run off
+the end of that 4 KB page into unrelated host memory, corrupting the
+kernel, while the guest's later pages stayed empty. So we translate
+each guest page through the EPT, as the CPU will, and copy at most one
+page at a time.
 
 ### Question 2.4
 
@@ -101,7 +127,13 @@ using freed memory.
 > treats as valid (hint: see Appendix A.10 for execute-only support), and
 > say why our code never creates such an entry.
 
-**Answer:** (your answer)
+**Answer:** An execute-only entry (X = 1, R = W = 0), which is valid on CPUs that
+report execute-only support in IA32_VMX_EPT_VPID_CAP bit 0 (Appendix
+A.10). A bit-0 test would call it missing: eptwalk() with alloc set
+would overwrite it with a new table, losing the mapping, and
+eptfree() would skip it and leak what it maps. Our code never creates
+one because every entry it writes has R set: upper-level entries get
+EPT_RWX and leaf entries get EPT_RWX | EPT_MEMTYPE_WB.
 
 ## Part 3: The VMCS, describing the guest and the host
 
@@ -112,7 +144,17 @@ using freed memory.
 > `want` has a bit that `high` has cleared, and why is returning an error
 > better than silently dropping the bit?
 
-**Answer:** (your answer)
+**Answer:** The low half lists bits that must be 1, so OR-ing it in forces them
+on; the high half has a 0 for every bit that must be 0, so AND-ing
+with it clears those; every other bit keeps the value we asked for, so
+the result satisfies both rules (the same idea as CR0/CR4 FIXED0 and
+FIXED1 in part 1). If `want` has a bit that `high` clears, the AND
+drops it, `(v & want) != want` detects that, and the function prints
+the missing bits and the MSR and returns -1, so `vmcreate()` fails.
+Silently dropping the bit would start a VM without a feature we rely
+on (for example EPT or I/O exiting), and the failure would show up
+later as a confusing entry error or misbehaving guest, far from its
+cause.
 
 ### Question 3.2
 
@@ -121,7 +163,15 @@ using freed memory.
 > is 0? Why is the all-ones setting more useful to someone debugging a
 > guest?
 
-**Answer:** (your answer)
+**Answer:** With a 0 bitmap the page fault is delivered through the guest's IDT.
+Vector 14 is beyond the IDTR limit of 0, so delivering it raises a
+general-protection fault; delivering that also fails, which becomes a
+double fault (vector 8); that fails too, so the CPU has a triple fault,
+which in VMX non-root operation is a VM exit with no trace of the
+original fault. With all ones, the first exception itself exits, and
+the exit reports its vector, error code and guest RIP (and for a page
+fault the faulting address), so the person debugging sees the real
+cause instead of a bare triple fault.
 
 ### Question 3.3
 
@@ -129,7 +179,13 @@ using freed memory.
 > about what the CPU does with a guest linear address when `CR0.PG = 0`
 > (SDM 28.6).
 
-**Answer:** (your answer)
+**Answer:** With unrestricted guest the guest may run with CR0.PG = 0, and then
+the CPU uses each guest linear address directly as a guest-physical
+address (SDM 28.6), with no page tables in between. Without EPT that
+address would go straight to host physical memory, so the guest could
+read and write all of the host's RAM. EPT is the only translation left
+that the hypervisor controls, so the SDM requires it whenever
+unrestricted guest is on (VM entry fails otherwise).
 
 ### Question 3.4
 
@@ -137,7 +193,15 @@ using freed memory.
 > Which two VMCS fields make that work? What happens if the guest tries to
 > set `CR4.VMXE` to 1, and why do we not let it?
 
-**Answer:** (your answer)
+**Answer:** The CR4 guest/host mask (with the VMXE bit set, so the host owns
+VMXE) and the CR4 read shadow (with VMXE = 0): a guest read of CR4
+takes owned bits from the shadow, so it sees 0. If the guest writes
+CR4 with VMXE = 1, the value differs from the shadow in an owned bit,
+so the write causes a VM exit (a control-register access) instead of
+taking effect; our run loop does not emulate it, so runvm stops. We do
+not let the guest change it because the real VMXE must stay 1 while
+the host is in VMX operation, and we do not support nested
+virtualization, so the guest must not believe it can use VMX.
 
 ## Part 4: Entering and leaving the guest
 
