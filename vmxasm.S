@@ -62,6 +62,17 @@ vmx_enter:
   # registers and regs on the stack, and write %rsp into the VMCS field
   # HOST_RSP.
   #   example, one line of it:  pushq %rbp   (saves the host's %rbp)
+  pushq %rbp                  # 48(%rsp) after all pushes
+  pushq %rbx                  # 40(%rsp)
+  pushq %r12                  # 32(%rsp)
+  pushq %r13                  # 24(%rsp)
+  pushq %r14                  # 16(%rsp)
+  pushq %r15                  #  8(%rsp)
+  pushq %rdi                  #  0(%rsp): regs, found by vmx_exit
+  # HOST_RSP = %rsp, so the next exit lands on this frame. VMWRITE
+  # takes the field encoding in a register: value first, field second.
+  movq  $HOST_RSP, %rax
+  vmwrite %rsp, %rax
 
   # Test 'launched' now: the movs below don't change the flags.
   # %esi is about to be overwritten by the guest's RSI, so its zero /
@@ -75,6 +86,21 @@ vmx_enter:
   # flags set by the testl above must survive until the jnz below.
   #   example, one line of it:  movq 8(%rdi), %rbx
   #   (%rbx = the 8 bytes at address regs + 8: the guest's rbx)
+  movq  0(%rdi), %rax
+  movq  8(%rdi), %rbx
+  movq  16(%rdi), %rcx
+  movq  24(%rdi), %rdx
+  movq  32(%rdi), %rsi        # destroys 'launched'; tested above
+  movq  48(%rdi), %rbp
+  movq  56(%rdi), %r8
+  movq  64(%rdi), %r9
+  movq  72(%rdi), %r10
+  movq  80(%rdi), %r11
+  movq  88(%rdi), %r12
+  movq  96(%rdi), %r13
+  movq  104(%rdi), %r14
+  movq  112(%rdi), %r15
+  movq  40(%rdi), %rdi        # last: this overwrites the regs pointer
 
   # Enter the guest. ZF still holds the result of testl above.
   jnz   1f                    # launched != 0: already launched, resume
@@ -120,3 +146,34 @@ vmx_exit:
   # return 0 from vmx_enter.
   #   example, one line of it:  movq %rbx, 8(%rdi)
   #   (the 8 bytes at address regs + 8 = the guest's rbx, if %rdi = regs)
+  # Every register holds a guest value. Free %rdi by pushing it: then
+  # 0(%rsp) = guest rdi and 8(%rsp) = regs (the top of block A's frame).
+  pushq %rdi
+  movq  8(%rsp), %rdi         # %rdi = regs
+  movq  %rax, 0(%rdi)
+  movq  %rbx, 8(%rdi)
+  movq  %rcx, 16(%rdi)
+  movq  %rdx, 24(%rdi)
+  movq  %rsi, 32(%rdi)
+  movq  %rbp, 48(%rdi)
+  movq  %r8, 56(%rdi)
+  movq  %r9, 64(%rdi)
+  movq  %r10, 72(%rdi)
+  movq  %r11, 80(%rdi)
+  movq  %r12, 88(%rdi)
+  movq  %r13, 96(%rdi)
+  movq  %r14, 104(%rdi)
+  movq  %r15, 112(%rdi)
+  popq  %rax                  # guest rdi (rax is already saved)
+  movq  %rax, 40(%rdi)
+  # The stack is back to block A's frame. Unwind it as the failure
+  # path does, but return 0.
+  addq  $8, %rsp              # drop the saved regs pointer
+  popq  %r15
+  popq  %r14
+  popq  %r13
+  popq  %r12
+  popq  %rbx
+  popq  %rbp
+  xorl  %eax, %eax            # return value: 0 means a VM exit
+  ret

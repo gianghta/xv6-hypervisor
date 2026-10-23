@@ -563,6 +563,49 @@ static void
 vmxhoststate(void)
 {
   /* HW1 part 4: write this function; see HW1.md. */
+  struct cpu *c = mycpu();
+
+  /* Control registers: the kernel's own, so exits land in the kernel. */
+  vmwrite(HOST_CR0, rcr0());
+  /* The current process's page table; the kernel half is shared. */
+  vmwrite(HOST_CR3, rcr3());
+  vmwrite(HOST_CR4, rcr4());
+
+  /*
+   * Selectors.  Host selectors must have RPL = 0 and TI = 0, and CS
+   * and TR must be nonzero.  CS is the kernel code segment; the data
+   * segment registers are not used in 64-bit mode so a null selector
+   * is fine (allowed since the host is 64-bit).
+   */
+  vmwrite(HOST_CS_SELECTOR, SEG_KCODE << 3);
+  vmwrite(HOST_SS_SELECTOR, 0);
+  vmwrite(HOST_DS_SELECTOR, 0);
+  vmwrite(HOST_ES_SELECTOR, 0);
+  vmwrite(HOST_FS_SELECTOR, 0);
+  vmwrite(HOST_GS_SELECTOR, 0);
+  vmwrite(HOST_TR_SELECTOR, SEG_TSS << 3);
+
+  /*
+   * Segment bases.  FS/GS bases live in MSRs, and a VM exit loads them
+   * from these fields, so we write back the current values and the
+   * exit leaves them unchanged.  (xv6-64 does not use them for per-CPU
+   * data; mycpu() finds the CPU from its local APIC id.)  The exit
+   * does not read the TR, GDTR or IDTR from memory; it takes their
+   * bases from these fields, so they must name this CPU's TSS and GDT
+   * and the kernel's IDT.
+   */
+  vmwrite(HOST_FS_BASE, rdmsr(MSR_IA32_FS_BASE));
+  vmwrite(HOST_GS_BASE, rdmsr(MSR_IA32_GS_BASE));
+  vmwrite(HOST_TR_BASE, (uint64)&c->ts);
+  vmwrite(HOST_GDTR_BASE, (uint64)c->gdt);
+  vmwrite(HOST_IDTR_BASE, (uint64)idt);
+
+  /* The kernel does not use SYSENTER; load zeros on exit. */
+  vmwrite(HOST_IA32_SYSENTER_CS, 0);
+  vmwrite(HOST_IA32_SYSENTER_ESP, 0);
+  vmwrite(HOST_IA32_SYSENTER_EIP, 0);
+  /* Loaded on exit because we set EXIT_LOAD_IA32_EFER in vmcsinit(). */
+  vmwrite(HOST_IA32_EFER, rdmsr(EFER_MSR));
 }
 
 /*
@@ -836,7 +879,24 @@ vmsetreg(int id, int reg, uint64 val)
   struct vm *vm;
 
   /* HW1 part 5: write this function; see HW1.md. */
-  return -1;
+  if((vm = getvm(id)) == 0 || reg < 0 || reg >= VMREG_NREGS)
+    return -1;
+  switch(reg){
+  case VMREG_RSP:
+    vm->rsp = val;
+    break;
+  case VMREG_RIP:
+    vm->rip = val;
+    break;
+  case VMREG_RFLAGS:
+    /* RFLAGS bit 1 always reads as 1; VM entry checks for it. */
+    vm->rflags = val | 0x2;
+    break;
+  default:
+    /* VMREG_RAX..VMREG_R15 follow the layout of struct guestregs. */
+    ((uint64*)&vm->regs)[reg] = val;
+  }
+  return 0;
 }
 
 /*
@@ -853,7 +913,23 @@ vmgetreg(int id, int reg, uint64 *val)
   struct vm *vm;
 
   /* HW1 part 5: write this function; see HW1.md. */
-  return -1;
+  if((vm = getvm(id)) == 0 || reg < 0 || reg >= VMREG_NREGS)
+    return -1;
+  switch(reg){
+  case VMREG_RSP:
+    *val = vm->rsp;
+    break;
+  case VMREG_RIP:
+    *val = vm->rip;
+    break;
+  case VMREG_RFLAGS:
+    *val = vm->rflags;
+    break;
+  default:
+    /* VMREG_RAX..VMREG_R15 follow the layout of struct guestregs. */
+    *val = ((uint64*)&vm->regs)[reg];
+  }
+  return 0;
 }
 
 /* Mask for the low `size` bytes (1, 2 or 4) of an I/O access. */
@@ -874,7 +950,23 @@ static int
 vmxmsr(struct vm *vm, int write)
 {
   /* HW1 part 5: write this function; see HW1.md. */
-  return -1;
+  uint64 val;
+
+  if((uint)vm->regs.rcx != EFER_MSR)
+    return -1;
+  if(write){
+    val = (vm->regs.rdx << 32) | (uint)vm->regs.rax;
+    /*
+     * The processor sets LMA itself when the guest enables paging
+     * with LME set; LMA is read-only to software, so preserve ours.
+     */
+    vm->efer = (val & ~(uint64)EFER_LMA) | (vm->efer & EFER_LMA);
+  } else {
+    /* Return the saved value; writes to EAX/EDX zero the upper halves. */
+    vm->regs.rax = (uint)vm->efer;
+    vm->regs.rdx = vm->efer >> 32;
+  }
+  return 0;
 }
 
 /*
@@ -889,7 +981,64 @@ static int
 vmxhandle(struct vm *vm, struct vmexit *e, uint inslen)
 {
   /* HW1 part 5: write this function; see HW1.md. */
-  return 0;
+  /* Part 5 checkpoint (passed); uncomment to trace every exit. */
+  /* cprintf("exit %d rip %x\n", (uint64)e->reason, e->rip); */
+
+  switch(e->reason){
+  case EXIT_EXTERNAL_INTR:
+    /*
+     * The interrupt is still pending in the local APIC (we don't
+     * acknowledge it on exit), so the host took it at popcli().
+     * Nothing to do but resume the guest.
+     */
+    return 1;
+  case EXIT_EXCEPTION_NMI:
+    /*
+     * This reason covers both guest exceptions (which we send to user
+     * space for debugging) and NMIs, told apart by the interruption
+     * type in the exit interruption-information field.
+     */
+    if(INTR_INFO_TYPE(e->intrinfo) == INTR_TYPE_NMI)
+      return 1; /* a host NMI; xv6 has no use for it */
+    return 0;
+  case EXIT_RDMSR:
+  case EXIT_WRMSR:
+    /*
+     * Emulate, then advance RIP past the RDMSR/WRMSR (the processor
+     * does not, since it was an exit rather than a completed
+     * instruction).  Unsupported MSRs go to user space.
+     */
+    if(vmxmsr(vm, e->reason == EXIT_WRMSR) < 0)
+      return 0;
+    vm->rip += inslen;
+    return 1;
+  case EXIT_HLT:
+    /* Skip the HLT so a later vmrun() continues after it. */
+    vm->rip += inslen;
+    return 0;
+  case EXIT_IO:
+    /*
+     * Exit qualification for I/O (SDM Table 30-5): bits 2:0 are the
+     * size minus one, bit 3 is the direction (1 = IN), bit 4 is set
+     * for string instructions, bits 31:16 are the port.  We don't
+     * decode INS/OUTS (they need a memory address and a count), so
+     * send them to user space unchanged, without moving RIP.
+     */
+    if(e->qual & (1 << 4))
+      return 0;
+    e->io.size = (e->qual & 0x7) + 1;
+    e->io.in = (e->qual >> 3) & 1;
+    e->io.port = (e->qual >> 16) & 0xFFFF;
+    /* IN/OUT can be 1 or 2 bytes long (port in DX or immediate). */
+    vm->rip += inslen;
+    /* OUT sends the low size bytes of RAX; an IN is completed by runvm. */
+    if(!e->io.in)
+      e->io.data = vm->regs.rax & iomask(e->io.size);
+    return 0;
+  default:
+    /* Anything else (EPT violation, CPUID, triple fault, ...). */
+    return 0;
+  }
 }
 
 /*
@@ -1003,9 +1152,14 @@ vmrun(int id, struct vmexit *ue)
       vm->efer = vmread(GUEST_IA32_EFER);
       e.rip = vm->rip;
     }
-    /* Release the VMCS and turn interrupts back on (HW1 part 5, Step 8). */
-    popcli();  /* a pending host interrupt is delivered here */
+    /*
+     * Release the VMCS and turn interrupts back on (HW1 part 5, Step 8).
+     * VMCLEAR must come first: once interrupts are on we may be
+     * rescheduled on another CPU, and this CPU must not still hold the
+     * VMCS active (SDM 27.11.1).
+     */
     vmclear(V2P(vm->vmcs));
+    popcli();  /* a pending host interrupt is delivered here */
 
     /*
      * Failed entries and VMLAUNCH failures always go to user space.

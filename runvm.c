@@ -56,6 +56,21 @@ static char image[MAXIMAGE];
 static void
 completein(int vm, int size, uint val)
 {
+  uint64 rax;
+
+  if(size == 4){
+    /* A 32-bit write to EAX zero-extends into the upper half of RAX. */
+    rax = val;
+  } else {
+    /* An 8- or 16-bit write to AL/AX leaves the other bytes of RAX alone. */
+    if(vmgetreg(vm, VMREG_RAX, &rax) < 0)
+      return;
+    if(size == 1)
+      rax = (rax & ~0xFFULL) | (val & 0xFF);
+    else
+      rax = (rax & ~0xFFFFULL) | (val & 0xFFFF);
+  }
+  vmsetreg(vm, VMREG_RAX, rax);
 }
 
 /*
